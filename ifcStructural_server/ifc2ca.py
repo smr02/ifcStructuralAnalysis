@@ -1,0 +1,643 @@
+# Ifc2CA - IFC Code_Aster utility
+# Copyright (C) 2020, 2021 Ioannis P. Christovasilis <ipc@aethereng.com>
+#
+# This file is part of Ifc2CA.
+#
+# Ifc2CA is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Lesser General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# Ifc2CA is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Lesser General Public License for more details.
+#
+# You should have received a copy of the GNU Lesser General Public License
+# along with Ifc2CA.  If not, see <http://www.gnu.org/licenses/>.
+
+from __future__ import division
+from __future__ import print_function
+import json
+import ifcopenshell
+import numpy as np
+from pathlib import Path
+
+
+class IFC2CA:
+    def __init__(self, filename):
+        self.filename = filename
+        self.file = None
+        self.result = {}
+        self.warnings = []
+        self.tol = 1e-06
+
+    def convert(self):
+        self.file = ifcopenshell.open(self.filename)
+        for model in self.file.by_type("IfcStructuralAnalysisModel"):
+            elements = self.get_structural_items(model, item_type="IfcStructuralMember")
+            connections = self.get_structural_items(
+                model, item_type="IfcStructuralConnection"
+            )
+
+            materialdb = []
+            materials = list(dict.fromkeys([e["material"] for e in elements]))
+            for mat in [mat for mat in materials if mat]:
+                id = int(mat.split("|")[1])
+                material = self.get_material_properties(self.file.by_id(id))
+                material["relatedElements"] = [
+                    e["referenceName"]
+                    for e in elements
+                    if "material" in e and e["material"] == mat
+                ]
+                materialdb.append(material)
+
+            profiledb = []
+            profiles = list(
+                dict.fromkeys([e["profile"] for e in elements if "profile" in e])
+            )
+            for prof in [prof for prof in profiles if prof]:
+                id = int(prof.split("|")[1])
+                profile = self.get_profile_properties(self.file.by_id(id))
+                profile["relatedElements"] = [
+                    e["referenceName"]
+                    for e in elements
+                    if "profile" in e and e["profile"] == prof
+                ]
+                profiledb.append(profile)
+
+            self.result = {
+                "referenceName": model.is_a() + "|" + str(model.id()),
+                "name": model.Name,
+                "id": model.GlobalId,
+                "elements": elements,
+                "connections": connections,
+                "db": {"materials": materialdb, "profiles": profiledb},
+                "warnings": self.warnings,
+            }
+
+            print(f"Model {model.Name} converted")
+            print(f"Number of elements: {len(elements)}")
+            print(f"Number of connections: {len(connections)}")
+            print(f"Number of materials: {len(materialdb)}")
+            print(f"Number of profiles: {len(profiledb)}")
+            print("")
+
+            break
+
+    def get_structural_items(self, model, item_type="IfcStructuralItem"):
+        items = []
+        for group in model.IsGroupedBy:
+            for item in group.RelatedObjects:
+                if not item.is_a(item_type):
+                    continue
+                data = self.get_item_data(item)
+                if data:
+                    items.append(data)
+        return items
+
+    def get_item_data(self, item):
+        transformation = self.get_transformation(item.ObjectPlacement)
+
+        if item.is_a("IfcStructuralCurveMember"):
+            representation = self.get_representation(item, "Edge")
+            material_profile = self.get_material_profile(item)
+            if not representation:
+                self.warnings.append(
+                    f"No representation defined for {item.is_a()}|{item.id()}. Member excluded"
+                )
+                return
+            if not material_profile:
+                self.warnings.append(f"No material defined for {item.is_a()}|{item.id()}")
+                self.warnings.append(f"No profile defined for {item.is_a()}|{item.id()}")
+                materialId = None
+                profileId = None
+            else:
+                material = material_profile.Material
+                materialId = material.is_a() + "|" + str(material.id())
+                profile = material_profile.Profile
+                profileId = profile.is_a() + "|" + str(profile.id())
+
+            geometry = self.get_geometry(representation)
+            orientation = self.get_1D_orientation(geometry, item.Axis)
+            connections = self.get_connection_data(item.ConnectedBy)
+            for conn in connections:
+                if not conn["orientation"]:
+                    conn["orientation"] = orientation
+            # --> Correct pointOnElement for eccentricity connection for ETABS files
+            length = np.linalg.norm(np.array(geometry[1]) - np.array(geometry[0]))
+            for c in connections:
+                if c["eccentricity"]:
+                    if (
+                        np.linalg.norm(np.array(c["eccentricity"]["pointOnElement"]))
+                        > length + self.tol
+                    ):
+                        print(
+                            f"{np.linalg.norm(np.array(c['eccentricity']['pointOnElement']))} > {length}"
+                        )
+                        self.warnings.append(
+                            f"Eccentricity in {item.is_a()}|{item.id()} corrected"
+                        )
+                        c["eccentricity"]["pointOnElement"][0] = length
+            # End <--
+            if transformation:
+                geometry = self.transform_vectors(geometry, transformation)
+                orientation = self.transform_vectors(
+                    orientation, transformation, include_translation=False
+                )
+                for c in connections:
+                    c["orientation"] = self.transform_vectors(
+                        c["orientation"], transformation, include_translation=False
+                    )
+                    if c["eccentricity"]:
+                        c["eccentricity"]["vector"] = self.transform_vectors(
+                            c["eccentricity"]["vector"],
+                            transformation,
+                            include_translation=False,
+                        )
+
+            return {
+                "referenceName": f"{item.is_a()}|{item.id()}",
+                "name": item.Name,
+                "id": item.GlobalId,
+                "geometryType": "line",
+                "predefinedType": item.PredefinedType,
+                "geometry": geometry,
+                "orientation": orientation,
+                "material": materialId,
+                "profile": profileId,
+                "connections": connections,
+            }
+
+        elif item.is_a("IfcStructuralSurfaceMember"):
+            representation = self.get_representation(item, "Face")
+            material = self.get_material_profile(item)
+            if not representation:
+                self.warnings.append(
+                    f"No representation defined for {item.is_a()}|{item.id()}. Member excluded"
+                )
+                return
+            if not material:
+                self.warnings.append(f"No material defined for {item.is_a()}|{item.id()}")
+                materialId = None
+            else:
+                materialId = material.is_a() + "|" + str(material.id())
+
+            geometry = self.get_geometry(representation)
+            orientation = self.get_2D_orientation(representation)
+            connections = self.get_connection_data(item.ConnectedBy)
+            for conn in connections:
+                if not conn["orientation"]:
+                    conn["orientation"] = orientation
+            if transformation:
+                geometry = self.transform_vectors(geometry, transformation)
+                orientation = self.transform_vectors(
+                    orientation, transformation, include_translation=False
+                )
+                for c in connections:
+                    c["orientation"] = self.transform_vectors(
+                        c["orientation"], transformation, include_translation=False
+                    )
+
+            return {
+                "referenceName": f"{item.is_a()}|{item.id()}",
+                "name": item.Name,
+                "id": item.GlobalId,
+                "geometryType": "surface",
+                "predefinedType": item.PredefinedType,
+                "thickness": item.Thickness,
+                "geometry": geometry,
+                "orientation": orientation,
+                "material": materialId,
+                "connections": connections,
+            }
+
+        elif item.is_a("IfcStructuralPointConnection"):
+            representation = self.get_representation(item, "Vertex")
+            if not representation:
+                self.warnings.append(
+                    f"No representation defined for {item.is_a()}|{item.id()}. Member excluded"
+                )
+                return
+
+            geometry = self.get_geometry(representation)
+            orientation = self.get_0D_orientation(item.ConditionCoordinateSystem)
+            if not orientation:
+                orientation = np.eye(3).tolist()
+            if transformation:
+                geometry = self.transform_vectors(geometry, transformation)
+                orientation = self.transform_vectors(
+                    orientation, transformation, include_translation=False
+                )
+
+            return {
+                "referenceName": f"{item.is_a()}|{item.id()}",
+                "name": item.Name,
+                "id": item.GlobalId,
+                "geometryType": "point",
+                "geometry": geometry,
+                "orientation": orientation,
+                "appliedCondition": self.get_connection_input(item, "point"),
+                "relatedElements": [
+                    f"{con.is_a()}|{con.id()}" for con in item.ConnectsStructuralMembers
+                ],
+            }
+
+        elif item.is_a("IfcStructuralCurveConnection"):
+            representation = self.get_representation(item, "Edge")
+            if not representation:
+                self.warnings.append(
+                    f"No representation defined for {item.is_a()}|{item.id()}. Member excluded"
+                )
+                return
+
+            geometry = self.get_geometry(representation)
+            orientation = self.get_1D_orientation(geometry, item.Axis)
+            if not orientation:
+                orientation = np.eye(3).tolist()
+            if transformation:
+                geometry = self.transform_vectors(geometry, transformation)
+                orientation = self.transform_vectors(
+                    orientation, transformation, include_translation=False
+                )
+
+            return {
+                "referenceName": f"{item.is_a()}|{item.id()}",
+                "name": item.Name,
+                "id": item.GlobalId,
+                "geometryType": "line",
+                "geometry": geometry,
+                "orientation": orientation,
+                "appliedCondition": self.get_connection_input(item, "line"),
+                "relatedElements": [
+                    f"{con.is_a()}|{con.id()}" for con in item.ConnectsStructuralMembers
+                ],
+            }
+
+    def get_transformation(self, placement):
+        if not placement:
+            return None
+        if placement.is_a("IfcLocalPlacement"):
+            if placement.PlacementRelTo:
+                print(
+                    "Warning! Object Placement with PlacementRelTo attribute is not supported and will be neglected"
+                )
+            axes = placement.RelativePlacement
+            location = np.array(self.get_coordinate(axes.Location))
+            if axes.Axis and axes.RefDirection:
+                xAxis = np.array(
+                    axes.RefDirection.DirectionRatios
+                )  # this can be not accurate (in the xz plane)
+                zAxis = np.array(axes.Axis.DirectionRatios)
+                zAxis /= np.linalg.norm(zAxis)
+                yAxis = np.cross(zAxis, xAxis)
+                yAxis /= np.linalg.norm(yAxis)
+                xAxis = np.cross(yAxis, zAxis)
+                xAxis /= np.linalg.norm(xAxis)
+            else:
+                if np.allclose(location, np.array([0.0, 0.0, 0.0])):
+                    return None
+                xAxis = np.array([1.0, 0.0, 0.0])
+                yAxis = np.array([0.0, 1.0, 0.0])
+                zAxis = np.array([0.0, 0.0, 1.0])
+            if (
+                np.allclose(location, np.array([0.0, 0.0, 0.0]))
+                and np.allclose(xAxis, np.array([1.0, 0.0, 0.0]))
+                and np.allclose(yAxis, np.array([0.0, 1.0, 0.0]))
+                and np.allclose(zAxis, np.array([0.0, 0.0, 1.0]))
+            ):
+                return None
+            return {
+                "location": location,
+                "rotationMatrix": np.array([xAxis, yAxis, zAxis]).transpose(),
+            }
+        else:
+            print(
+                f"Warning! Object Placement is of type {placement.is_a()}, which is not supported. Default considered"
+            )
+            return None
+
+    def get_representation(self, element, rep_type):
+        if not element.Representation:
+            return None
+        for representation in element.Representation.Representations:
+            rep = self.get_specific_representation(representation, "Reference", rep_type)
+            if rep:
+                return rep
+        else:
+            # print("Trying without rep identifier")
+            for representation in element.Representation.Representations:
+                rep = self.get_specific_representation(representation, None, rep_type)
+                if rep:
+                    return rep
+
+    def get_specific_representation(self, representation, rep_id, rep_type):
+        if (
+            representation.RepresentationIdentifier == rep_id or rep_id is None
+        ) and representation.RepresentationType == rep_type:
+            return representation
+        if representation.RepresentationType == "MappedRepresentation":
+            return self.get_specific_representation(
+                representation.Items[0].MappingSource.MappedRepresentation,
+                rep_id,
+                rep_type,
+            )
+
+    def get_geometry(self, representation):
+        # Maybe IfcOpenShell can use create_shape here to simplify this, but
+        # supposedly structural models are very simple anyway, so perhaps we
+        # can do without it.
+        item = representation.Items[0]
+        if item.is_a("IfcEdge"):
+            return [
+                self.get_coordinate(item.EdgeStart.VertexGeometry),
+                self.get_coordinate(item.EdgeEnd.VertexGeometry),
+            ]
+
+        elif item.is_a("IfcFaceSurface"):
+            edges = item.Bounds[0].Bound.EdgeList
+            coords = []
+            for edge in edges:
+                coords.append(
+                    self.get_coordinate(edge.EdgeElement.EdgeStart.VertexGeometry)
+                )
+            return coords
+
+        elif item.is_a("IfcVertexPoint"):
+            return self.get_coordinate(item.VertexGeometry)
+
+    def get_coordinate(self, point):
+        if point.is_a("IfcCartesianPoint"):
+            return list(point.Coordinates)
+
+    def get_0D_orientation(self, axes):
+        if axes and axes.Axis and axes.RefDirection:
+            xAxis = np.array(
+                axes.RefDirection.DirectionRatios
+            )  # this can be not strictly perpendicular (in the xz plane)
+            zAxis = np.array(axes.Axis.DirectionRatios)
+            zAxis /= np.linalg.norm(zAxis)
+            yAxis = np.cross(zAxis, xAxis)
+            yAxis /= np.linalg.norm(yAxis)
+            xAxis = np.cross(yAxis, zAxis)
+            xAxis /= np.linalg.norm(xAxis)
+
+            return [xAxis.tolist(), yAxis.tolist(), zAxis.tolist()]
+        else:  # return None and copy the elements orientation
+            return None
+
+    def get_1D_orientation(self, geometry, zAxis):
+        xAxis = np.array(geometry[1]) - np.array(geometry[0])
+        xAxis /= np.linalg.norm(xAxis)
+        zAxis = np.array(
+            zAxis.DirectionRatios
+        )  # this can be not strictly perpendicular (in the xz plane)
+        yAxis = np.cross(zAxis, xAxis)
+        yAxis /= np.linalg.norm(yAxis)
+        zAxis = np.cross(xAxis, yAxis)
+        zAxis /= np.linalg.norm(zAxis)
+
+        return [xAxis.tolist(), yAxis.tolist(), zAxis.tolist()]
+
+    def get_2D_orientation(self, representation):
+        item = representation.Items[0]
+        if item.is_a("IfcFaceSurface"):
+            axes = item.FaceSurface.Position
+            orientation = self.get_0D_orientation(axes)
+            if not orientation:
+                self.warnings.append(
+                    f"No local placement for Plane related to {item.is_a()}|{item.id()}. A unit orientation is considered"
+                )
+                return np.eye(3).tolist()
+            if not item.SameSense:
+                orientation = [[-v for v in vec] for vec in orientation]
+            return orientation
+
+    def transform_vectors(self, geometry, trsf, include_translation=True):
+        if not any(
+            isinstance(el, list) for el in geometry
+        ):  # single point which contains no list
+            geometry = [geometry]
+        globalGeometry = []
+
+        for p in geometry:
+            gp = trsf["rotationMatrix"].dot(np.array(p))
+            if include_translation:
+                gp += trsf["location"]
+            globalGeometry.append(gp.tolist())
+
+        if len(globalGeometry) == 1:  # single point
+            globalGeometry = globalGeometry[0]
+
+        return globalGeometry
+
+    def get_material_profile(self, element):
+        if not element.HasAssociations:
+            return None
+        for association in element.HasAssociations:
+            if not association.is_a("IfcRelAssociatesMaterial"):
+                continue
+            material = association.RelatingMaterial
+            if material.is_a("IfcMaterialProfileSet"):
+                # For now, we only deal with a single profile
+                return material.MaterialProfiles[0]
+            if material.is_a("IfcMaterialProfileSetUsage"):
+                return material.ForProfileSet.MaterialProfiles[0]
+            if material.is_a("IfcMaterial"):
+                return material
+
+    def get_material_properties(self, material):
+        psets = material.HasProperties
+
+        if self.get_pset_properties(psets, "Pset_MaterialMechanical"):
+            mechProps = self.get_pset_properties(psets, "Pset_MaterialMechanical")
+        else:
+            mechProps = self.get_pset_properties(psets, None)
+
+        if self.get_pset_properties(psets, "Pset_MaterialCommon"):
+            commonProps = self.get_pset_properties(psets, "Pset_MaterialCommon")
+        else:
+            commonProps = self.get_pset_properties(psets, None)
+
+        return {
+            "referenceName": material.is_a() + "|" + str(material.id()),
+            "name": material.Name,
+            "category": material.Category,
+            "mechProps": mechProps,
+            "commonProps": commonProps,
+        }
+
+    def get_pset_property(self, psets, pset_name, prop_name):
+        for pset in psets:
+            if pset.Name == pset_name or pset_name is None:
+                for prop in pset.Properties:
+                    if prop.Name == prop_name:
+                        return prop.NominalValue.wrappedValue
+
+    def get_pset_properties(self, psets, pset_name):
+        for pset in psets:
+            if pset.Name == pset_name or pset_name is None:
+                d = {}
+                for prop in pset.Properties:
+                    propName = prop.Name[0].lower() + prop.Name[1:]
+                    d[propName] = prop.NominalValue.wrappedValue
+                return d
+
+    def get_profile_properties(self, profile):
+        if profile.is_a("IfcRectangleProfileDef"):
+            return {
+                "referenceName": profile.is_a() + "|" + str(profile.id()),
+                "profileName": profile.ProfileName,
+                "profileType": profile.ProfileType,
+                "profileShape": "rectangular",
+                "xDim": profile.XDim,
+                "yDim": profile.YDim,
+            }
+
+        if profile.is_a("IfcIShapeProfileDef"):
+            psets = profile.HasProperties
+
+            if self.get_pset_properties(psets, "Pset_ProfileMechanical"):
+                mechProps = self.get_pset_properties(psets, "Pset_ProfileMechanical")
+            else:
+                mechProps = self.get_i_section_properties(profile, "iSymmetrical")
+
+            return {
+                "referenceName": f"{profile.is_a()}|{profile.id()}",
+                "profileName": profile.ProfileName,
+                "profileType": profile.ProfileType,
+                "profileShape": "iSymmetrical",
+                "mechProps": mechProps,
+                "commonProps": {
+                    "flangeThickness": profile.FlangeThickness,
+                    "webThickness": profile.WebThickness,
+                    "overallDepth": profile.OverallDepth,
+                    "overallWidth": profile.OverallWidth,
+                    "filletRadius": profile.FilletRadius,
+                },
+            }
+
+    def get_connection_data(self, itemList):
+        return [
+            {
+                "referenceName": f"{rel.is_a()}|{rel.id()}",
+                "id": rel.GlobalId,
+                "relatingElement": f"{rel.RelatingStructuralMember.is_a()}|{rel.RelatingStructuralMember.id()}",
+                "relatedConnection": f"{rel.RelatedStructuralConnection.is_a()}|{rel.RelatedStructuralConnection.id()}",
+                "orientation": self.get_0D_orientation(rel.ConditionCoordinateSystem),
+                "appliedCondition": self.get_connection_input(
+                    rel,
+                    self.get_geometry_type_from_connection(
+                        rel.RelatedStructuralConnection
+                    ),
+                ),
+                "eccentricity": None
+                if not rel.is_a("IfcRelConnectsWithEccentricity")
+                else {
+                    "vector": [
+                        0.0
+                        if not rel.ConnectionConstraint.EccentricityInX
+                        else rel.ConnectionConstraint.EccentricityInX,
+                        0.0
+                        if not rel.ConnectionConstraint.EccentricityInY
+                        else rel.ConnectionConstraint.EccentricityInY,
+                        0.0
+                        if not rel.ConnectionConstraint.EccentricityInZ
+                        else rel.ConnectionConstraint.EccentricityInZ,
+                    ],
+                    "pointOnElement": self.get_coordinate(
+                        rel.ConnectionConstraint.PointOnRelatingElement
+                    ),
+                },
+            }
+            for rel in itemList
+        ]
+
+    def get_geometry_type_from_connection(self, connection):
+        if connection.is_a("IfcStructuralPointConnection"):
+            return "point"
+        if connection.is_a("IfcStructuralCurveConnection"):
+            return "line"
+        if connection.is_a("IfcStructuralSurfaceConnection"):
+            return "surface"
+
+    def get_connection_input(self, connection, geometryType):
+        if connection.AppliedCondition:
+            if geometryType == "point":
+                return {
+                    "dx": connection.AppliedCondition.TranslationalStiffnessX.wrappedValue,
+                    "dy": connection.AppliedCondition.TranslationalStiffnessY.wrappedValue,
+                    "dz": connection.AppliedCondition.TranslationalStiffnessZ.wrappedValue,
+                    "drx": connection.AppliedCondition.RotationalStiffnessX.wrappedValue,
+                    "dry": connection.AppliedCondition.RotationalStiffnessY.wrappedValue,
+                    "drz": connection.AppliedCondition.RotationalStiffnessZ.wrappedValue,
+                }
+
+            if geometryType == "line":
+                return {
+                    "dx": connection.AppliedCondition.TranslationalStiffnessByLengthX.wrappedValue,
+                    "dy": connection.AppliedCondition.TranslationalStiffnessByLengthY.wrappedValue,
+                    "dz": connection.AppliedCondition.TranslationalStiffnessByLengthZ.wrappedValue,
+                    "drx": connection.AppliedCondition.RotationalStiffnessByLengthX.wrappedValue,
+                    "dry": connection.AppliedCondition.RotationalStiffnessByLengthY.wrappedValue,
+                    "drz": connection.AppliedCondition.RotationalStiffnessByLengthZ.wrappedValue,
+                }
+
+            if geometryType == "surface":
+                return {
+                    "dx": connection.AppliedCondition.TranslationalStiffnessByAreaX.wrappedValue,
+                    "dy": connection.AppliedCondition.TranslationalStiffnessByAreaY.wrappedValue,
+                    "dz": connection.AppliedCondition.TranslationalStiffnessByAreaZ.wrappedValue,
+                }
+
+        return connection.AppliedCondition
+
+    def get_i_section_properties(self, profile, profileShape):
+        if profileShape == "iSymmetrical":
+            tf = profile.FlangeThickness
+            tw = profile.WebThickness
+            h = profile.OverallDepth
+            b = profile.OverallWidth
+
+            A = b * h - (b - tw) * (h - 2 * tf)
+            Iy = b * (h ** 3) / 12 - (b - tw) * ((h - 2 * tf) ** 3) / 12
+            Iz = (2 * tf) * (b ** 3) / 12 + (h - 2 * tf) * (tw ** 3) / 12
+            Jx = 1 / 3 * ((h - tf) * (tw ** 3) + 2 * b * (tf ** 3))
+
+            return {
+                "crossSectionArea": A,
+                "momentOfInertiaY": Iy,
+                "momentOfInertiaZ": Iz,
+                "torsionalConstantX": Jx,
+            }
+
+
+if __name__ == "__main__":
+    fileNames = [
+        # "cantilever_01",
+        "portal_01",
+        "grid_of_beams",
+        # "slab_01",
+        "structure_01",
+        "building_01",
+        "building_02",
+    ]
+    files = fileNames
+    text = []
+
+    for fileName in files:
+        BASE_PATH = Path(
+            "/home/smr/Github/ifc_files"
+            # "/home/jesusbill/Dev-Projects/github.com/IfcOpenShell/analysis-models/ifcFiles/"
+        )
+        print(BASE_PATH / f"{fileName}.ifc")
+        ifc2ca = IFC2CA(BASE_PATH / f"{fileName}.ifc")
+        ifc2ca.convert()
+        text.append(type(ifc2ca.result))
+        with open(BASE_PATH / f"{fileName}.json", "w") as f:
+            f.write(json.dumps(ifc2ca.result, indent=4))
+
+    print()
+    print()
+    for i in text:
+        print(i)

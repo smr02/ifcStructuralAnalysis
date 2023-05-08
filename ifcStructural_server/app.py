@@ -4,6 +4,7 @@ import ifcopenshell
 import os 
 import sys
 import numpy as np
+import ifc2ca
 
 app = Flask(__name__)
 
@@ -14,6 +15,7 @@ app = Flask(__name__)
 # ifc_path = '/ifc/grid_of_beams.ifc'
 # ifc_path = '/ifc/building_01.ifc'
 # ifc_path = '/ifc/building_02.ifc'
+# ifc_path = []
 
 
 app = Flask(__name__)
@@ -28,6 +30,7 @@ def load_IFC():
     try: ifc_file = ifcopenshell.open(ifc_path)
     except: ifc_file = []
     
+    GlobalId_edited = False
     for i in ifc_file:
         try: 
             if '$' in i.GlobalId:
@@ -35,8 +38,12 @@ def load_IFC():
                 while '$' in new_id:
                     new_id = ifcopenshell.guid.new()
                 i.GlobalId = new_id
+                GlobalId_edited = True
         except:
             pass
+    
+    if GlobalId_edited:
+        ifc_file.write(ifc_path)
 
     
     return ifc_path
@@ -60,6 +67,11 @@ def start():
 
     return jsonify(output)
 
+@app.route('/ifc2ca')
+def from_ifc2ca():
+    ifc_json = ifc2ca.IFC2CA(ifc_path)
+    ifc_json.convert()
+    return jsonify(ifc_json.result)
 
 
 
